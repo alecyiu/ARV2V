@@ -5,9 +5,9 @@ reconstructed mp4 plus a side-by-side comparison and a meta.json into a fresh
 run folder under outputs/v2v_recon/.
 
 Usage:
-    python inference/v2v_recon.py --video-id 044
-    python inference/v2v_recon.py --video-id waymo_000044 --steps 30 --seed 0
-    python inference/v2v_recon.py --video-id 044 --no-side-by-side
+    python inference/v2v_recon.py --video-id 0
+    python inference/v2v_recon.py --video-id waymo_000044 --steps 30 --gpu 3
+    python inference/v2v_recon.py --video-id 44 --no-side-by-side
 """
 
 from __future__ import annotations
@@ -25,9 +25,11 @@ import torch
 from PIL import Image
 
 from config import (
+    DEFAULT_CONDITIONING_SCALE,
     DEFAULT_FPS_OUT,
     DEFAULT_GUIDANCE_SCALE,
     DEFAULT_HEIGHT,
+    DEFAULT_NEGATIVE_PROMPT,
     DEFAULT_NUM_FRAMES,
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_PROMPT,
@@ -37,181 +39,173 @@ from config import (
     video_path_for,
 )
 
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
-# ---------------------------------------------------------------------------
-# I/O helpers
-# ---------------------------------------------------------------------------
-def load_video_as_pil(path: Path, num_frames: int) -> tuple[list[Image.Image], float]:
-    """Read up to `num_frames` frames as PIL.Image.RGB. Return frames + source fps."""
-    meta = iio.immeta(path, plugin="pyav")
-    src_fps = float(meta.get("fps", DEFAULT_FPS_OUT))
+
+# --- frame I/O ---------------------------------------------------------------
+
+def read_video(path: Path, num_frames: int) -> tuple[list[Image.Image], float]:
+    """Read up to `num_frames` RGB uint8 frames; return frames + source fps."""
+    src_fps = float(iio.immeta(path, plugin="pyav").get("fps", DEFAULT_FPS_OUT))
     frames: list[Image.Image] = []
     for frame in iio.imiter(path, plugin="pyav"):
-        # imiter returns HxWx3 uint8 RGB
         frames.append(Image.fromarray(frame))
         if len(frames) == num_frames:
             break
     if len(frames) < num_frames:
-        raise ValueError(
-            f"{path.name}: only {len(frames)} frames available, need {num_frames}"
-        )
+        raise ValueError(f"{path.name}: only {len(frames)} frames, need {num_frames}")
     return frames, src_fps
 
 
-def resize_letterbox(frames: list[Image.Image], target_h: int, target_w: int) -> list[Image.Image]:
-    """Center-crop + resize each frame to target HxW preserving aspect ratio."""
-    out: list[Image.Image] = []
-    target_ratio = target_w / target_h
+def center_crop_resize(frames: list[Image.Image], h: int, w: int) -> list[Image.Image]:
+    """Center-crop to target aspect, then resize to HxW."""
+    target = w / h
+    out = []
     for img in frames:
-        w, h = img.size
-        src_ratio = w / h
-        # First crop to target aspect, then resize
-        if src_ratio > target_ratio:
-            # too wide -> crop width
-            new_w = int(round(h * target_ratio))
-            x0 = (w - new_w) // 2
-            img = img.crop((x0, 0, x0 + new_w, h))
-        elif src_ratio < target_ratio:
-            # too tall -> crop height
-            new_h = int(round(w / target_ratio))
-            y0 = (h - new_h) // 2
-            img = img.crop((0, y0, w, y0 + new_h))
-        out.append(img.resize((target_w, target_h), Image.BICUBIC))
+        iw, ih = img.size
+        ratio = iw / ih
+        if ratio > target:  # too wide -> crop width
+            nw = int(round(ih * target))
+            img = img.crop(((iw - nw) // 2, 0, (iw - nw) // 2 + nw, ih))
+        elif ratio < target:  # too tall -> crop height
+            nh = int(round(iw / target))
+            img = img.crop((0, (ih - nh) // 2, iw, (ih - nh) // 2 + nh))
+        out.append(img.resize((w, h), Image.BICUBIC))
     return out
 
 
-def export_video(frames: list[Image.Image], path: Path, fps: float) -> None:
-    arr = np.stack([np.asarray(f) for f in frames], axis=0)  # (T, H, W, 3) uint8
+def to_pil_uint8(frame) -> Image.Image:
+    """Coerce a PIL/numpy frame (any dtype) to RGB uint8 PIL."""
+    if isinstance(frame, Image.Image):
+        return frame if frame.mode == "RGB" else frame.convert("RGB")
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint8:  # diffusers video pipelines often emit float32 in [0, 1]
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    elif arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    return Image.fromarray(arr)
+
+
+def write_video(frames: list[Image.Image], path: Path, fps: float) -> None:
+    arr = np.stack([np.asarray(f) for f in frames], axis=0)
     iio.imwrite(path, arr, plugin="pyav", fps=fps, codec="h264")
 
 
-def export_side_by_side(
-    left: list[Image.Image], right: list[Image.Image], path: Path, fps: float
-) -> None:
+def write_side_by_side(left, right, path: Path, fps: float) -> None:
     pairs = [
         Image.fromarray(np.concatenate([np.asarray(l), np.asarray(r)], axis=1))
         for l, r in zip(left, right)
     ]
-    export_video(pairs, path, fps)
+    write_video(pairs, path, fps)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline loading
-# ---------------------------------------------------------------------------
-def load_pipeline(model_path: Path, dtype: torch.dtype):
-    """Import and load the VACE pipeline. Imports are local so non-inference
-    callers (e.g. the unit-test or a list-runs helper) don't pull in diffusers.
-    """
-    try:
-        from diffusers import WanVACEPipeline  # type: ignore
-    except ImportError as e:
-        raise SystemExit(
-            "diffusers WanVACEPipeline not found — install/upgrade with:\n"
-            "  uv pip install -U 'diffusers>=0.34' transformers accelerate "
-            "huggingface_hub safetensors"
-        ) from e
+# --- pipeline ----------------------------------------------------------------
 
+def load_pipeline(model_path: Path, dtype: torch.dtype, gpu_id: int):
+    from diffusers import WanVACEPipeline  # type: ignore[import-not-found]
     pipe = WanVACEPipeline.from_pretrained(str(model_path), torch_dtype=dtype)
-    # Sequential CPU offload keeps peak VRAM low (works fine for 1.3B on a
-    # single A6000 with ~20 GB free; remove for max speed if 30+ GB is free).
-    pipe.enable_model_cpu_offload()
+    pipe.enable_model_cpu_offload(gpu_id=gpu_id)
     return pipe
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- main --------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--video-id", required=True,
-                   help="Short id ('44', '000044', 'waymo_000044') or full filename.")
+                   help="Short id ('44'), padded ('000044'), or 'waymo_000044'.")
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
+    p.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT,
+                   help="What to steer AWAY from via classifier-free guidance. "
+                        "Wan's default fights warm/over-saturated color cast; pass '' to disable.")
     p.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     p.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     p.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     p.add_argument("--steps", type=int, default=DEFAULT_NUM_INFERENCE_STEPS)
     p.add_argument("--guidance", type=float, default=DEFAULT_GUIDANCE_SCALE)
+    p.add_argument("--conditioning-scale", type=float, default=DEFAULT_CONDITIONING_SCALE,
+                   help="VACE control strength. 1.0 = source video dominates (reconstruction); "
+                        "lower (e.g. 0.5) lets the prompt actually edit the content.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--model-path", default=str(WAN_VACE_1_3B_LOCAL),
-                   help="Local path to the downloaded VACE 1.3B snapshot.")
-    p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
-    p.add_argument("--no-side-by-side", action="store_true",
-                   help="Skip writing side_by_side.mp4.")
+    p.add_argument("--dtype", choices=list(DTYPES), default="bf16")
+    p.add_argument("--gpu", type=int, default=0, help="CUDA device index.")
+    p.add_argument("--model-path", default=str(WAN_VACE_1_3B_LOCAL))
+    p.add_argument("--no-side-by-side", action="store_true")
     p.add_argument("--out-fps", type=float, default=None,
-                   help="Output fps (default: source fps, falling back to 10).")
+                   help="Output fps (default: source fps).")
     return p.parse_args()
+
+
+def validate(args: argparse.Namespace, src_path: Path, model_path: Path) -> None:
+    """Fail fast on missing inputs or invalid device. Exits via SystemExit on error."""
+    for label, p in [("source video", src_path), ("model", model_path)]:
+        if not p.exists():
+            sys.exit(f"ERROR: {label} not found: {p}")
+    if not torch.cuda.is_available():
+        sys.exit("ERROR: CUDA not available.")
+    n = torch.cuda.device_count()
+    if not 0 <= args.gpu < n:
+        sys.exit(f"ERROR: --gpu {args.gpu} out of range (have {n} devices).")
 
 
 def main() -> int:
     args = parse_args()
-
     src_path = video_path_for(args.video_id)
-    if not src_path.exists():
-        print(f"ERROR: source video not found: {src_path}", file=sys.stderr)
-        return 1
-
     model_path = Path(args.model_path)
-    if not model_path.exists():
-        print(f"ERROR: model not found at {model_path}. "
-              f"Run `python inference/download_model.py` first.", file=sys.stderr)
-        return 1
+    validate(args, src_path, model_path)
 
-    # Per-run output directory
+    # Run folder. Symlink the input so it's self-contained.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = V2V_RECON_OUTPUTS / f"{stamp}_{src_path.stem}"
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Symlink the input so the run folder is self-contained
     input_link = run_dir / "input.mp4"
-    if input_link.exists() or input_link.is_symlink():
-        input_link.unlink()
+    input_link.unlink(missing_ok=True)
     input_link.symlink_to(src_path)
 
-    print(f"[1/4] Loading source: {src_path}")
-    src_frames, src_fps = load_video_as_pil(src_path, args.num_frames)
-    out_fps = args.out_fps if args.out_fps is not None else src_fps
-    print(f"      {len(src_frames)} frames @ {src_fps} fps "
-          f"(model expects {args.num_frames}); output fps = {out_fps}")
+    # Read + condition input.
+    src_frames, src_fps = read_video(src_path, args.num_frames)
+    out_fps = src_fps if args.out_fps is None else args.out_fps
+    cond_frames = center_crop_resize(src_frames, args.height, args.width)
+    print(f"input  : {src_path}  ({len(src_frames)} frames @ {src_fps} fps)")
+    print(f"resize : -> {args.width}x{args.height}")
 
-    print(f"[2/4] Resizing to {args.width}x{args.height}")
-    cond_frames = resize_letterbox(src_frames, args.height, args.width)
+    # Load pipeline.
+    print(f"model  : {model_path} ({args.dtype}) on "
+          f"cuda:{args.gpu} ({torch.cuda.get_device_name(args.gpu)})")
+    t0 = time.perf_counter()
+    pipe = load_pipeline(model_path, DTYPES[args.dtype], gpu_id=args.gpu)
+    load_time = time.perf_counter() - t0
+    print(f"         ready in {load_time:.1f}s")
 
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
-    print(f"[3/4] Loading pipeline ({model_path}, {args.dtype})")
-    t0 = time.time()
-    pipe = load_pipeline(model_path, dtype)
-    load_time = time.time() - t0
-    print(f"      pipeline ready in {load_time:.1f}s")
-
-    print(f"[4/4] Generating ({args.num_frames} frames, {args.steps} steps, "
-          f"guidance={args.guidance}, seed={args.seed})")
-    generator = torch.Generator(device="cuda").manual_seed(args.seed)
-    t0 = time.time()
+    # Generate.
+    print(f"infer  : {args.num_frames} frames, {args.steps} steps, "
+          f"guidance={args.guidance}, seed={args.seed}")
+    t0 = time.perf_counter()
     result = pipe(
         prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
         video=cond_frames,
+        conditioning_scale=args.conditioning_scale,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance,
-        generator=generator,
+        generator=torch.Generator(device=f"cuda:{args.gpu}").manual_seed(args.seed),
     )
-    gen_time = time.time() - t0
-    out_frames = result.frames[0]  # diffusers convention: List[List[PIL.Image]]
-    print(f"      generated in {gen_time:.1f}s ({gen_time/args.num_frames:.2f}s/frame)")
+    gen_time = time.perf_counter() - t0
+    out_frames = [to_pil_uint8(f) for f in result.frames[0]]
+    print(f"         done in {gen_time:.1f}s ({gen_time / args.num_frames:.2f}s/frame)")
 
-    # Write outputs
+    # Write outputs + meta.
     output_path = run_dir / "output.mp4"
-    export_video(out_frames, output_path, fps=out_fps)
-    print(f"      wrote {output_path}")
-
+    write_video(out_frames, output_path, fps=out_fps)
     sbs_path: Path | None = None
     if not args.no_side_by_side:
-        # cond_frames is already at the model's resolution, matches output dims
         sbs_path = run_dir / "side_by_side.mp4"
-        export_side_by_side(cond_frames, list(out_frames), sbs_path, fps=out_fps)
-        print(f"      wrote {sbs_path}")
+        write_side_by_side(cond_frames, out_frames, sbs_path, fps=out_fps)
 
     meta = {
         "input": str(src_path),
@@ -219,6 +213,8 @@ def main() -> int:
         "output_fps": out_fps,
         "model_path": str(model_path),
         "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "conditioning_scale": args.conditioning_scale,
         "height": args.height,
         "width": args.width,
         "num_frames": args.num_frames,
@@ -226,6 +222,7 @@ def main() -> int:
         "guidance_scale": args.guidance,
         "seed": args.seed,
         "dtype": args.dtype,
+        "gpu": args.gpu,
         "load_time_s": round(load_time, 2),
         "gen_time_s": round(gen_time, 2),
         "timestamp_utc": stamp,
@@ -236,7 +233,7 @@ def main() -> int:
         },
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"\nDone. Run folder: {run_dir}")
+    print(f"\ndone -> {run_dir}")
     return 0
 
 

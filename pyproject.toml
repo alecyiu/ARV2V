@@ -7,9 +7,21 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
     "diffusers>=0.37.1",
+    "ftfy>=6.0",
     "imageio[pyav]>=2.37.3",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
     "polars>=1.40.1",
+    "torch",
     "transformers>=5.6.2",
 ]
+
+# Pin torch to PyTorch's CUDA 12.6 wheel index — the host driver (12060) is
+# too old for the default cu13 wheels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

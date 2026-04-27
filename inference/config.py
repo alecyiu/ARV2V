@@ -45,7 +45,19 @@ DEFAULT_NUM_FRAMES = 49
 DEFAULT_FPS_OUT = 10  # matches Waymo source fps, even though VACE is "16 fps"
 DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_GUIDANCE_SCALE = 5.0
+DEFAULT_CONDITIONING_SCALE = 1.0  # VACE control strength: 1.0 = full source dominance, lower = more prompt influence
 DEFAULT_PROMPT = "The video depicts a view of a street"  # from train metadata
+# Canonical Wan VACE negative prompt (from the official diffusers example).
+# Without it, CFG has nothing to steer away from and outputs drift toward the
+# model's training-distribution palette (warm/yellow for Wan).
+DEFAULT_NEGATIVE_PROMPT = (
+    "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
+    "paintings, images, static, overall gray, worst quality, low quality, JPEG "
+    "compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
+    "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
+    "still picture, messy background, three legs, many people in the background, "
+    "walking backwards"
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
