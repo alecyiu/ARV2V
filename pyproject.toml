@@ -1,0 +1,15 @@
+[project]
+name = "arv2v"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.13.0",
+    "diffusers>=0.37.1",
+    "imageio[pyav]>=2.37.3",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "polars>=1.40.1",
+    "transformers>=5.6.2",
+]

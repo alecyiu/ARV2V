@@ -217,3 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .claude/settings.local.json
+
+# Project: large data, model snapshots, run artefacts
+/waymo/
+/checkpoints/
+/outputs/
