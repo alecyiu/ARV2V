@@ -19,14 +19,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import imageio.v3 as iio
-import numpy as np
 import torch
-from PIL import Image
 
 from config import (
     DEFAULT_CONDITIONING_SCALE,
-    DEFAULT_FPS_OUT,
     DEFAULT_GUIDANCE_SCALE,
     DEFAULT_HEIGHT,
     DEFAULT_NEGATIVE_PROMPT,
@@ -38,79 +34,16 @@ from config import (
     WAN_VACE_1_3B_LOCAL,
     video_path_for,
 )
+from utils import (
+    DTYPES,
+    center_crop_resize,
+    infer_one,
+    load_pipeline,
+    read_video,
+    write_side_by_side,
+    write_video,
+)
 
-DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
-
-
-# --- frame I/O ---------------------------------------------------------------
-
-def read_video(path: Path, num_frames: int) -> tuple[list[Image.Image], float]:
-    """Read up to `num_frames` RGB uint8 frames; return frames + source fps."""
-    src_fps = float(iio.immeta(path, plugin="pyav").get("fps", DEFAULT_FPS_OUT))
-    frames: list[Image.Image] = []
-    for frame in iio.imiter(path, plugin="pyav"):
-        frames.append(Image.fromarray(frame))
-        if len(frames) == num_frames:
-            break
-    if len(frames) < num_frames:
-        raise ValueError(f"{path.name}: only {len(frames)} frames, need {num_frames}")
-    return frames, src_fps
-
-
-def center_crop_resize(frames: list[Image.Image], h: int, w: int) -> list[Image.Image]:
-    """Center-crop to target aspect, then resize to HxW."""
-    target = w / h
-    out = []
-    for img in frames:
-        iw, ih = img.size
-        ratio = iw / ih
-        if ratio > target:  # too wide -> crop width
-            nw = int(round(ih * target))
-            img = img.crop(((iw - nw) // 2, 0, (iw - nw) // 2 + nw, ih))
-        elif ratio < target:  # too tall -> crop height
-            nh = int(round(iw / target))
-            img = img.crop((0, (ih - nh) // 2, iw, (ih - nh) // 2 + nh))
-        out.append(img.resize((w, h), Image.BICUBIC))
-    return out
-
-
-def to_pil_uint8(frame) -> Image.Image:
-    """Coerce a PIL/numpy frame (any dtype) to RGB uint8 PIL."""
-    if isinstance(frame, Image.Image):
-        return frame if frame.mode == "RGB" else frame.convert("RGB")
-    arr = np.asarray(frame)
-    if arr.dtype != np.uint8:  # diffusers video pipelines often emit float32 in [0, 1]
-        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-    if arr.ndim == 2:
-        arr = np.stack([arr] * 3, axis=-1)
-    elif arr.shape[-1] == 4:
-        arr = arr[..., :3]
-    return Image.fromarray(arr)
-
-
-def write_video(frames: list[Image.Image], path: Path, fps: float) -> None:
-    arr = np.stack([np.asarray(f) for f in frames], axis=0)
-    iio.imwrite(path, arr, plugin="pyav", fps=fps, codec="h264")
-
-
-def write_side_by_side(left, right, path: Path, fps: float) -> None:
-    pairs = [
-        Image.fromarray(np.concatenate([np.asarray(l), np.asarray(r)], axis=1))
-        for l, r in zip(left, right)
-    ]
-    write_video(pairs, path, fps)
-
-
-# --- pipeline ----------------------------------------------------------------
-
-def load_pipeline(model_path: Path, dtype: torch.dtype, gpu_id: int):
-    from diffusers import WanVACEPipeline  # type: ignore[import-not-found]
-    pipe = WanVACEPipeline.from_pretrained(str(model_path), torch_dtype=dtype)
-    pipe.enable_model_cpu_offload(gpu_id=gpu_id)
-    return pipe
-
-
-# --- main --------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -156,7 +89,6 @@ def main() -> int:
     model_path = Path(args.model_path)
     validate(args, src_path, model_path)
 
-    # Run folder. Symlink the input so it's self-contained.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = V2V_RECON_OUTPUTS / f"{stamp}_{src_path.stem}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -164,14 +96,12 @@ def main() -> int:
     input_link.unlink(missing_ok=True)
     input_link.symlink_to(src_path)
 
-    # Read + condition input.
     src_frames, src_fps = read_video(src_path, args.num_frames)
     out_fps = src_fps if args.out_fps is None else args.out_fps
     cond_frames = center_crop_resize(src_frames, args.height, args.width)
     print(f"input  : {src_path}  ({len(src_frames)} frames @ {src_fps} fps)")
     print(f"resize : -> {args.width}x{args.height}")
 
-    # Load pipeline.
     print(f"model  : {model_path} ({args.dtype}) on "
           f"cuda:{args.gpu} ({torch.cuda.get_device_name(args.gpu)})")
     t0 = time.perf_counter()
@@ -179,27 +109,24 @@ def main() -> int:
     load_time = time.perf_counter() - t0
     print(f"         ready in {load_time:.1f}s")
 
-    # Generate.
     print(f"infer  : {args.num_frames} frames, {args.steps} steps, "
           f"guidance={args.guidance}, seed={args.seed}")
-    t0 = time.perf_counter()
-    result = pipe(
+    out_frames, gen_time = infer_one(
+        pipe,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        video=cond_frames,
-        conditioning_scale=args.conditioning_scale,
+        cond_frames=cond_frames,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
-        generator=torch.Generator(device=f"cuda:{args.gpu}").manual_seed(args.seed),
+        steps=args.steps,
+        guidance=args.guidance,
+        conditioning_scale=args.conditioning_scale,
+        seed=args.seed,
+        gpu_id=args.gpu,
     )
-    gen_time = time.perf_counter() - t0
-    out_frames = [to_pil_uint8(f) for f in result.frames[0]]
     print(f"         done in {gen_time:.1f}s ({gen_time / args.num_frames:.2f}s/frame)")
 
-    # Write outputs + meta.
     output_path = run_dir / "output.mp4"
     write_video(out_frames, output_path, fps=out_fps)
     sbs_path: Path | None = None

@@ -93,7 +93,7 @@ command. Example: turn `waymo_000000.mp4` into a snowy version on GPU 3.
 uv run python inference/v2v_recon.py \
   --video-id 0 \
   --gpu 3 \
-  --conditioning-scale 0.4 \
+  --conditioning-scale 0.6 \
   --guidance 8.0 \
   --steps 50 \
   --prompt "A heavy winter snowstorm view from a forward-facing dashcam. \
