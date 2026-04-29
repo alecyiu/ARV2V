@@ -1,6 +1,6 @@
 # ARV2V 
 
-Adversarial Robustness V2V — Wan 2.1 VACE 1.3B inference pipeline for Waymo
+Auto regressive V2V — Wan 2.1 VACE 1.3B inference pipeline for Waymo
 front-camera (camera_id=0) clips.
 
 ## Layout
