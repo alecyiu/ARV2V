@@ -47,16 +47,21 @@ DEFAULT_NUM_INFERENCE_STEPS = 30
 DEFAULT_GUIDANCE_SCALE = 5.0
 DEFAULT_CONDITIONING_SCALE = 1.0  # VACE control strength: 1.0 = full source dominance, lower = more prompt influence
 DEFAULT_PROMPT = "The video depicts a view of a street"  # from train metadata
-# Canonical Wan VACE negative prompt (from the official diffusers example).
-# Without it, CFG has nothing to steer away from and outputs drift toward the
-# model's training-distribution palette (warm/yellow for Wan).
+# Negative prompt tailored for automotive front-camera (Waymo dashcam) footage.
+# Drops the human-anatomy items from Wan's default (irrelevant for driving) and
+# adds the failure modes we actually see: warm/yellow color cast and deformed
+# vehicles/road geometry. Leads with the color terms because that's the most
+# visible drift in our reconstructions.
 DEFAULT_NEGATIVE_PROMPT = (
-    "Bright tones, overexposed, static, blurred details, subtitles, style, works, "
-    "paintings, images, static, overall gray, worst quality, low quality, JPEG "
-    "compression residue, ugly, incomplete, extra fingers, poorly drawn hands, "
-    "poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, "
-    "still picture, messy background, three legs, many people in the background, "
-    "walking backwards"
+    "yellow color cast, warm tones, overexposed, oversaturated colors, washed out, "
+    "overall gray, worst quality, low quality, JPEG compression residue, blurred "
+    "details, motion blur smear, ghosting, static frame, frozen motion, still picture, "
+    "cartoon, anime, painting, illustration, sketch, CGI render, video game graphics, "
+    "3D render, surreal, distorted geometry, warped buildings, melting cars, "
+    "deformed vehicles, asymmetric wheels, missing windows, floating cars, duplicated "
+    "vehicles, unrealistic shadows, fisheye distortion, lens flare, dirty lens, "
+    "water droplets on lens, watermark, logo, subtitles, text overlay, timestamp, "
+    "tilted horizon, wrong perspective, mirrored image, upside down"
 )
 
 # ---------------------------------------------------------------------------
