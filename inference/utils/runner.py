@@ -38,7 +38,7 @@ def run_grid(
     gpu_ids: list[int],
     steps: int = 50,
     guidance: float = 7.5,
-    conditioning_scale: float = 0.5,
+    conditioning_scale: float | dict[str, float] | None = None,
     seed: int = 0,
     height: int = 480,
     width: int = 832,
@@ -53,8 +53,21 @@ def run_grid(
 ) -> dict:
     """Run the (rows x cols) grid demo across all listed GPUs.
 
+    `conditioning_scale` resolution:
+        - None  -> each preset uses its own `recommended_conditioning_scale`.
+        - float -> uniform across all presets.
+        - dict  -> per-preset override; falls back to recommended for missing keys.
+
     Returns a dict with `run_dir`, `grid_path`, `per_cell_paths`, and `meta`.
     """
+
+    def cond_for(name: str) -> float:
+        recommended = PRESETS[name].recommended_conditioning_scale
+        if conditioning_scale is None:
+            return recommended
+        if isinstance(conditioning_scale, dict):
+            return float(conditioning_scale.get(name, recommended))
+        return float(conditioning_scale)
     model_path = Path(model_path or WAN_VACE_1_3B_LOCAL)
 
     # ---- validate -----------------------------------------------------------
@@ -81,12 +94,13 @@ def run_grid(
 
     n_rows = len(video_ids)
     n_cols = 1 + len(preset_names)
+    cond_by_preset = {name: cond_for(name) for name in preset_names}
     print(f"gpus  : {gpu_ids}  ({len(gpu_ids)} device{'s' if len(gpu_ids) > 1 else ''})")
     print(f"model : {model_path} ({dtype})")
     print(f"grid  : {n_rows} rows x {n_cols} cols "
           f"({n_rows * len(preset_names)} inferences)")
-    print(f"params: cond={conditioning_scale}  guidance={guidance}  "
-          f"steps={steps}  seed={seed}")
+    print(f"params: guidance={guidance}  steps={steps}  seed={seed}")
+    print(f"cond  : " + ", ".join(f"{n}={cond_by_preset[n]}" for n in preset_names))
 
     # ---- read GT clips once -------------------------------------------------
     gt_frames: dict[str, list] = {}
@@ -103,15 +117,16 @@ def run_grid(
     for r, vid in enumerate(video_ids):
         for c_off, name in enumerate(preset_names):
             preset = PRESETS[name]
+            cond = cond_by_preset[name]
             key = cache_key(
                 video_id=vid, preset_name=name,
                 prompt=preset.prompt, negative_prompt=preset.negative_prompt,
                 height=height, width=width, num_frames=num_frames,
                 steps=steps, guidance=guidance,
-                conditioning_scale=conditioning_scale,
+                conditioning_scale=cond,
                 seed=seed, dtype=dtype, model_path=model_path,
             )
-            work.append((r, 1 + c_off, vid, name, key, cached_mp4_path(key)))
+            work.append((r, 1 + c_off, vid, name, cond, key, cached_mp4_path(key)))
 
     n_hit = sum(1 for *_, p in work if p.exists())
     n_miss = len(work) - n_hit
@@ -124,7 +139,7 @@ def run_grid(
 
     misses = []
     for entry in work:
-        r, c, _vid, _name, _key, cache_path = entry
+        r, c, _vid, _name, _cond, _key, cache_path = entry
         cached = load_cached_frames(cache_path, num_frames)
         if cached is not None:
             cells[r][c] = cached
@@ -158,7 +173,7 @@ def run_grid(
     counter_lock = threading.Lock()
 
     def run_cell(entry):
-        r, c, vid, name, key, cache_path = entry
+        r, c, vid, name, cond, key, cache_path = entry
         gid = gpu_q.get()
         try:
             preset = PRESETS[name]
@@ -170,7 +185,7 @@ def run_grid(
                 cond_frames=gt_frames[vid],
                 height=height, width=width, num_frames=num_frames,
                 steps=steps, guidance=guidance,
-                conditioning_scale=conditioning_scale,
+                conditioning_scale=cond,
                 seed=seed, gpu_id=gid,
             )
             elapsed = time.perf_counter() - t0
@@ -179,7 +194,7 @@ def run_grid(
                 counter["done"] += 1
                 idx = counter["done"]
             print(f"[{idx:>2}/{len(misses)}] {vid:>3} x {name:<10} "
-                  f"cuda:{gid}  {elapsed:.1f}s")
+                  f"cond={cond:<4} cuda:{gid}  {elapsed:.1f}s")
             return entry, out_frames
         finally:
             gpu_q.put(gid)
@@ -191,7 +206,7 @@ def run_grid(
             futures = {pool.submit(run_cell, e): e for e in misses}
             for f in as_completed(futures):
                 entry, out_frames = f.result()
-                r, c, *_ = entry
+                r, c = entry[0], entry[1]
                 cells[r][c] = out_frames
     run_time = time.perf_counter() - run_t0
 
@@ -225,12 +240,38 @@ def run_grid(
             input_link.unlink(missing_ok=True)
             input_link.symlink_to(video_paths[vid].resolve())
             input_links[vid] = str(input_link)
-        for r, c, vid, name, key, cache_path in work:
+        for r, c, vid, name, cond, key, cache_path in work:
             clip_dir = run_dir / row_labels[r]
             dst = clip_dir / f"{row_labels[r]}_{name}.mp4"
             dst.unlink(missing_ok=True)
             shutil.copy2(cache_path, dst)
             per_cell_paths[f"{vid}/{name}"] = str(dst)
+
+    cell_records = []
+    for r, c, vid, name, cond, key, cache_path in work:
+        preset = PRESETS[name]
+        cell_records.append({
+            "row": r,
+            "col": c,
+            "row_label": row_labels[r],
+            "col_label": col_labels[c],
+            "video_id": vid,
+            "video_input_path": str(video_paths[vid]),
+            "preset": name,
+            "prompt": preset.prompt,
+            "negative_prompt": preset.negative_prompt,
+            "conditioning_scale": cond,
+            "guidance": guidance,
+            "steps": steps,
+            "seed": seed,
+            "dtype": dtype,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "cache_key": key,
+            "cache_path": str(cache_path),
+            "output_path": per_cell_paths.get(f"{vid}/{name}"),
+        })
 
     meta = {
         "timestamp_utc": stamp,
@@ -240,12 +281,21 @@ def run_grid(
         "row_labels": row_labels,
         "gpu_ids": list(gpu_ids),
         "model_path": str(model_path),
-        "generation": {
-            "steps": steps, "guidance": guidance,
-            "conditioning_scale": conditioning_scale,
-            "seed": seed, "height": height, "width": width,
-            "num_frames": num_frames, "dtype": dtype,
+        "shared_params": {
+            "guidance": guidance,
+            "steps": steps,
+            "seed": seed,
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "dtype": dtype,
         },
+        "conditioning_scale_input": (
+            conditioning_scale
+            if not isinstance(conditioning_scale, dict)
+            else dict(conditioning_scale)
+        ),
+        "conditioning_scale_resolved": cond_by_preset,
         "grid": {
             "cell_w": cell_w, "cell_h": cell_h,
             "header_h": header_h, "label_w": label_w,
@@ -254,17 +304,10 @@ def run_grid(
             "cache_dir": str(CACHE_DIR),
             "hits": n_hit, "misses": n_miss, "total": len(work),
         },
-        "prompts": {
-            n: {
-                "prompt": PRESETS[n].prompt,
-                "negative_prompt": PRESETS[n].negative_prompt,
-            }
-            for n in preset_names
-        },
+        "input_links": input_links,
+        "cells": cell_records,
         "load_time_s": round(load_time, 2),
         "run_time_s": round(run_time, 2),
-        "input_links": input_links,
-        "per_cell": per_cell_paths,
         "output": str(grid_path),
     }
     (run_dir / "meta.json").write_text(
