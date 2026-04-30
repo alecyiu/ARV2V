@@ -46,7 +46,8 @@ def run_grid(
     dtype: str = "bf16",
     cell_w: int = 320,
     cell_h: int = 184,
-    header_h: int = 32,
+    title_h: int = 24,
+    header_h: int = 48,
     label_w: int = 96,
     model_path: Path | str | None = None,
     save_per_cell: bool = True,
@@ -221,13 +222,21 @@ def run_grid(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     col_labels = ["GT"] + [PRESETS[n].label for n in preset_names]
+    col_sublabels = [""] + [f"cond={cond_by_preset[n]}" for n in preset_names]
     row_labels = [f"waymo_{int(v):06d}" for v in video_ids]
+    title = (
+        f"Wan 2.1 VACE 1.3B   |   steps={steps}   guidance={guidance}"
+    )
 
     grid_path = run_dir / "grid.mp4"
     compose_grid_video(
         cells, grid_path, fps=out_fps,
-        col_labels=col_labels, row_labels=row_labels,
-        cell_w=cell_w, cell_h=cell_h, header_h=header_h, label_w=label_w,
+        col_labels=col_labels,
+        col_sublabels=col_sublabels,
+        row_labels=row_labels,
+        title=title,
+        cell_w=cell_w, cell_h=cell_h,
+        title_h=title_h, header_h=header_h, label_w=label_w,
     )
 
     per_cell_paths: dict[str, str] = {}
@@ -297,8 +306,12 @@ def run_grid(
         ),
         "conditioning_scale_resolved": cond_by_preset,
         "grid": {
+            "title": title,
+            "col_labels": col_labels,
+            "col_sublabels": col_sublabels,
+            "row_labels": row_labels,
             "cell_w": cell_w, "cell_h": cell_h,
-            "header_h": header_h, "label_w": label_w,
+            "title_h": title_h, "header_h": header_h, "label_w": label_w,
         },
         "cache": {
             "cache_dir": str(CACHE_DIR),
